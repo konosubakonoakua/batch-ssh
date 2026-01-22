@@ -1,0 +1,162 @@
+#!/bin/bash
+
+# Enhanced FPGA Bitstream Loading Script using FPGA Manager
+# Usage: ./load_bitstream.sh <path_to_zip_file>
+
+# Color codes for output formatting
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Logging functions
+info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Function to extract base filename from ZIP
+get_base_filename() {
+  local ZIP_FILE="$1"
+  # List contents, find first .bit file, and remove extension
+  unzip -l "$ZIP_FILE" | grep -oE '[^ ]+\.bit' | head -1 | sed 's/\.bit$//'
+}
+
+load_bitstream() {
+  local ZIP_FILE="$1"
+
+  # Validate input parameter
+  if [ $# -ne 1 ]; then
+    error "Usage: $0 <path_to_zip_file>"
+    return 1
+  fi
+
+  # Check if ZIP file exists
+  if [ ! -f "$ZIP_FILE" ]; then
+    error "ZIP file not found: $ZIP_FILE"
+    return 1
+  fi
+
+  # Dynamically determine base filename
+  local BASE_NAME=$(get_base_filename "$ZIP_FILE")
+  if [ -z "$BASE_NAME" ]; then
+    error "No .bit file found in ZIP archive: $ZIP_FILE"
+    return 1
+  fi
+
+  # Set file paths based on detected name
+  local BIT_FILE="/tmp/${BASE_NAME}.bit"
+  local BIF_FILE="/tmp/${BASE_NAME}.bif"
+  local BIN_FILE="/opt/bitstreams/${BASE_NAME}.bit.bin"
+
+  info "Detected bitstream file: $BASE_NAME"
+  info "Starting FPGA deployment process..."
+  info "ZIP file: $ZIP_FILE"
+  info "Bit file: $BIT_FILE"
+  info "Output file: $BIN_FILE"
+
+  # Stop existing services
+  info "Stopping existing laccs services..."
+  if screen -list | grep -q "laccs"; then
+    screen -X -S laccs quit
+    info "Screen session stopped"
+  else
+    warn "No laccs screen session found"
+  fi
+
+  if pgrep -f "laccs" >/dev/null; then
+    pkill -f "laccs"
+    info "laccs processes terminated"
+  else
+    warn "No laccs processes found"
+  fi
+
+  if pgrep -f "st.cmd" >/dev/null; then
+    pkill -f "st.cmd"
+    info "epics ioc st.cmd processes terminated"
+  else
+    warn "No epics ioc processes found"
+  fi
+
+  # Wait for processes to fully stop
+  sleep 1
+
+  # Clean up previous files
+  info "Cleaning up previous files..."
+  rm -f "$BIT_FILE" "$BIF_FILE"
+
+  # Unzip the file
+  info "Extracting ZIP file..."
+  if ! unzip -o "$ZIP_FILE" -d /tmp/; then
+    error "Failed to extract ZIP file: $ZIP_FILE"
+    return 1
+  fi
+
+  # Verify bit file exists after extraction
+  if [ ! -f "$BIT_FILE" ]; then
+    error "Bit file not found after extraction: $BIT_FILE"
+    return 1
+  fi
+
+  # Create BIF file
+  info "Creating BIF configuration file..."
+  echo "all: { $BIT_FILE }" >"$BIF_FILE"
+
+  # Create output directory if it doesn't exist
+  mkdir -p /opt/bitstreams/
+
+  # Generate FPGA image using bootgen
+  info "Generating FPGA image..."
+  if ! mkbootimage -u "$BIF_FILE" "$BIN_FILE"; then
+    error "Failed to generate FPGA image using mkbootimage"
+    return 1
+  fi
+
+  if command -v fpgautil &>/dev/null; then
+    info "Attempting to load FPGA image using fpgautil..."
+    if fpgautil -b "$BIN_FILE"; then
+      info "FPGA image loaded successfully using fpgautil."
+      return 0
+    else
+      warn "fpgautil failed, falling back to FPGA Manager sysfs interface."
+    fi
+  else
+    warn "fpgautil command not found, falling back to FPGA Manager sysfs interface."
+
+    local FPGA_MGR_PATH="/sys/class/fpga_manager/fpga0"
+    if [ ! -d "$FPGA_MGR_PATH" ]; then
+      error "FPGA Manager sysfs interface not found at $FPGA_MGR_PATH. No fallback available."
+      return 1
+    fi
+
+    info "Using FPGA Manager sysfs interface for bitstream loading..."
+
+    echo 0 >"${FPGA_MGR_PATH}/flags"
+    mkdir -p /lib/firmware/
+    cp "$BIN_FILE" /lib/firmware/
+    if ! echo $(basename "$BIN_FILE") >"${FPGA_MGR_PATH}/firmware"; then
+      error "Failed to initiate bitstream loading via sysfs."
+      return 1
+    fi
+
+    local STATUS=$(cat "${FPGA_MGR_PATH}/state" 2>/dev/null)
+    case "$STATUS" in
+    "operating")
+      info "FPGA image loaded successfully via sysfs. Current state: $STATUS"
+      ;;
+    *)
+      error "FPGA loading may have failed. Current state: $STATUS"
+      ;;
+    esac
+
+  fi
+
+  info "FPGA deployment completed!"
+  info "Output file: $BIN_FILE"
+  return 0
+}
+
+# If script is executed directly (not sourced), run the function
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  load_bitstream "$@"
+  exit $?
+fi
