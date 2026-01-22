@@ -1,2 +1,10 @@
+/build/
+/dist/
+/logs/
+/archives/*
+!archives/fpga/
+!archives/fpga/loadbitstream
+*/__pycache__/
+
 *.tgz
-/logs/*
+*.zip
